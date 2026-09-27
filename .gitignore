@@ -1,0 +1,6 @@
+*.log
+*.tmp
+.install.json
+ChatGPT.ico
+.vscode/
+.migration-backup/
