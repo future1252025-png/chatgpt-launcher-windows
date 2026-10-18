@@ -110,7 +110,7 @@ if ($PSCmdlet.ShouldProcess($destinationRoot, 'Install ChatGPT Launcher')) {
 
     $marker = [pscustomobject]@{
         Product     = 'ChatGPTLauncher'
-        Version     = '2.0.0'
+        Version     = '2.1.0'
         InstalledAt = (Get-Date).ToString('o')
         Source      = $sourceRoot
         DesktopShortcutName = if ($NoDesktopShortcut) { $null } else { $DesktopShortcutName }
@@ -144,7 +144,7 @@ if ($PSCmdlet.ShouldProcess($destinationRoot, 'Install ChatGPT Launcher')) {
         New-LauncherShortcut -ShortcutPath (Join-Path $programs 'ChatGPT Launcher.lnk') -ScriptPath $installedScript -WorkingDirectory $destinationRoot -IconPath $iconPath
     }
 
-    Write-Host "ChatGPT Launcher 2.0.0 installed to $destinationRoot"
+    Write-Host "ChatGPT Launcher 2.1.0 installed to $destinationRoot"
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $installedScript -Diagnostics
     if ($LASTEXITCODE -ne 0) { throw 'Installation completed, but launcher diagnostics failed.' }
 

@@ -1,6 +1,6 @@
 # ChatGPT Launcher for Windows
 
-An independent launcher for the Microsoft Store ChatGPT/Codex desktop app. It starts the registered app, waits for a real window, and can prepare the packaged local runtime when a first launch gets stuck.
+An independent launcher for the Microsoft Store ChatGPT/Codex desktop app. It starts the registered app, waits for a real window, and can prepare the packaged local runtime before launch.
 
 This community utility is not affiliated with or endorsed by OpenAI.
 
@@ -44,17 +44,18 @@ Double-click `Launch-ChatGPT.cmd` without installing, or run:
 .\Launch-ChatGPT.ps1 -RuntimeRepair Never
 ```
 
-The default wait is 600 seconds. The launcher makes at most three startup attempts with short increasing delays.
+The default window wait deadline is 1200 seconds. The launcher makes at most three startup attempts with short increasing delays. If the app is already running without a window, it waits without stopping or restarting that process.
 
 ## Runtime preparation
 
-Automatic runtime preparation is considered when the app has no window after 15 seconds, a matching fresh `.staging-*` directory exists, and the installed Store package contains the expected `cua_node` runtime. The launcher:
+Automatic runtime preparation runs before launch when the app is not running and the installed Store package contains the expected `cua_node` runtime. A cached package version, runtime identifier, and file count help avoid repeated preparation. When preparation is needed, the launcher:
 
-1. Copies the packaged runtime to a temporary directory on the same volume.
-2. Checks every source file's destination and length, plus SHA-256 hashes for core binaries.
-3. Stops only `ChatGPT.exe` processes belonging to the selected Store package.
-4. Preserves an incomplete runtime directory as a backup, then moves the prepared directory into place.
-5. Rechecks the final directory and starts the app again.
+1. Computes the runtime directory identifier from SHA-256 hashes of the manifest and core binaries.
+2. Confirms that the app is not running and copies the packaged runtime to a temporary directory under the runtime root.
+3. Checks that every source file exists in the temporary directory with the same length.
+4. Confirms again that the app is not running, renames any existing destination as a backup, and moves the prepared directory into place.
+5. Rechecks file lengths, records the package version, runtime identifier, and file count, then removes the old backup.
+6. Starts the app and waits for its window. If preparation fails, it logs a warning and lets the official app prepare its own runtime.
 
 It does not download binaries or change account data, proxy settings, or the registry. If a future app version changes its runtime layout, use `-RuntimeRepair Never` and let the official app manage its files.
 

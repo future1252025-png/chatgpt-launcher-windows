@@ -1,6 +1,6 @@
 # ChatGPT Launcher for Windows
 
-一个面向普通 Windows 用户的 ChatGPT/Codex 桌面版启动器。它负责可靠启动 Microsoft Store 应用、等待真实窗口出现，并在首次启动的本地运行时准备阶段安全地提供加速恢复。[English README](README.en.md)。
+一个面向普通 Windows 用户的 ChatGPT/Codex 桌面版启动器。它负责可靠启动 Microsoft Store 应用、等待真实窗口出现，并可在应用启动前准备本地运行时。[English README](README.en.md)。
 
 This project is an independent community utility and is not affiliated with or endorsed by OpenAI.
 
@@ -13,7 +13,9 @@ This project is an independent community utility and is not affiliated with or e
 - 最多三次启动尝试和指数退避，不会持续形成崩溃循环。
 - 日志保存在 `%LOCALAPPDATA%\ChatGPTLauncher\Logs`，最多保留 20 份。
 - 可选的首次启动运行时修复：只复制已安装、经过 Store 签名的软件包内容，不从网络下载文件。
-- 运行时先复制到临时目录，验证文件和核心哈希后才停止应用并切换；旧的不完整目录会被保留为备份。
+- 仅在应用未运行时准备运行时，复制到临时目录并验证文件长度后再切换；切换成功后清理旧目录备份。
+- 缓存软件包版本、运行时标识和文件数量，减少后续启动时的重复准备。
+- 应用已在后台启动时继续等待，不终止或重启已有进程。
 - 安装器生成本地图标，应用更新后快捷方式图标不会指向被删除的旧版本目录。
 - 不需要管理员权限，不修改注册表，不修改代理配置。
 
@@ -68,18 +70,18 @@ Launch-ChatGPT.cmd
 .\Launch-ChatGPT.ps1 -Diagnostics
 ```
 
-`RuntimeRepair Auto` 是默认值，最长等待 600 秒。只有同时满足以下条件时才会介入：应用超过 15 秒没有窗口、进程仍存在、检测到当前进程启动后创建的 `.staging-*` 目录、安装包中存在对应的运行时来源。
+`RuntimeRepair Auto` 是默认值，默认等待窗口的期限为 1200 秒。安装包包含对应的 `cua_node` 运行时且应用尚未运行时，启动器会在启动前检查缓存并按需准备运行时。若应用已经在后台启动，则继续等待其自行完成，不打断正在进行的运行时复制。使用 `-RuntimeRepair Never` 可跳过启动器的运行时准备。
 
 ## 安全设计
 
-运行时修复按以下顺序执行：
+需要准备运行时时，启动器按以下顺序执行：
 
-1. 从当前已安装的 Store 软件包复制到新的临时目录。
-2. 验证所有来源文件都存在且长度一致。
-3. 对 `node.exe` 和 `node_repl.exe` 做 SHA-256 对比。
-4. 只停止路径属于所选 Store 软件包的 `ChatGPT.exe` 进程。
-5. 将旧的不完整目录重命名为可恢复备份。
-6. 将验证后的目录移动到最终位置并再次验证。
+1. 根据软件包清单和核心二进制文件的 SHA-256 计算运行时目录标识。
+2. 确认应用未运行，从已安装的 Store 软件包复制到运行时根目录中的临时目录。
+3. 验证所有来源文件在临时目录中都存在且长度一致。
+4. 再次确认应用未运行，将旧目录重命名为备份，并将临时目录切换到最终位置。
+5. 再次验证文件长度，记录软件包版本、运行时标识和文件数量，再清理旧目录备份。
+6. 启动应用并等待窗口出现；准备失败时记录警告，让官方应用自行准备运行时。
 
 启动器不会删除 ChatGPT 用户数据，也不会下载或执行第三方二进制文件。
 

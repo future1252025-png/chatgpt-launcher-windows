@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateRange(15, 1800)]
-    [int]$WaitSeconds = 600,
+    [int]$WaitSeconds = 1200,
 
     [ValidateRange(1, 10)]
     [int]$MaxStartAttempts = 3,
@@ -17,7 +17,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$script:LauncherVersion = '2.0.0'
+$script:LauncherVersion = '2.1.0'
 $script:LogPath = $null
 $script:StateRoot = $null
 $script:Mutex = $null
@@ -190,21 +190,6 @@ function Get-StagingCandidate {
     return $null
 }
 
-function Get-TreeSummary {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-        return [pscustomobject]@{ Files = 0; Bytes = [int64]0 }
-    }
-
-    $count = 0
-    [int64]$bytes = 0
-    foreach ($file in @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue)) {
-        $count++
-        $bytes += $file.Length
-    }
-    return [pscustomobject]@{ Files = $count; Bytes = $bytes }
-}
-
 function Test-RuntimeTree {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -243,31 +228,6 @@ function Test-RuntimeTree {
     return $true
 }
 
-function Stop-ChatGptApplication {
-    param([Parameter(Mandatory = $true)]$Application)
-
-    $processes = @(Get-ChatGptProcesses -Application $Application)
-    if ($processes.Count -eq 0) { return }
-
-    Write-Log "Stopping $($processes.Count) process(es) from the selected Store package before the atomic runtime switch."
-    foreach ($process in $processes) {
-        try {
-            if ($process.MainWindowHandle -ne [IntPtr]::Zero) { [void]$process.CloseMainWindow() }
-        } catch { }
-    }
-
-    $stopDeadline = (Get-Date).AddSeconds(5)
-    while ((Get-Date) -lt $stopDeadline) {
-        if (@(Get-ChatGptProcesses -Application $Application).Count -eq 0) { return }
-        Start-Sleep -Milliseconds 250
-    }
-
-    foreach ($process in @(Get-ChatGptProcesses -Application $Application)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 1
-}
-
 function Assert-ChildPath {
     param(
         [Parameter(Mandatory = $true)][string]$Parent,
@@ -280,81 +240,154 @@ function Assert-ChildPath {
     }
 }
 
-function Repair-PackagedRuntime {
+function Get-BundledRuntimeIdentity {
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+
+    # Same 16-hex identity the desktop app uses for cua_node\<hash>.
+    $sentinels = @('manifest.json', 'bin/node.exe', 'bin/node_repl.exe')
+    $aggregate = [Security.Cryptography.IncrementalHash]::CreateHash(
+        [Security.Cryptography.HashAlgorithmName]::SHA256
+    )
+    try {
+        foreach ($relativePath in $sentinels) {
+            $sourcePath = Join-Path $RuntimeRoot ($relativePath.Replace('/', '\'))
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "Runtime sentinel is missing: $sourcePath"
+            }
+            $digest = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $aggregate.AppendData([Text.Encoding]::UTF8.GetBytes($relativePath))
+            $aggregate.AppendData([byte[]](0))
+            $aggregate.AppendData([Text.Encoding]::UTF8.GetBytes($digest))
+            $aggregate.AppendData([byte[]](0))
+        }
+        $hex = -join ($aggregate.GetHashAndReset() | ForEach-Object { $_.ToString('x2') })
+        return $hex.Substring(0, 16)
+    } finally {
+        $aggregate.Dispose()
+    }
+}
+
+function Get-RuntimeRecordPath {
+    return Join-Path $script:StateRoot 'package-runtime.txt'
+}
+
+function Read-RuntimeRecord {
+    $path = Get-RuntimeRecordPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+    if ($lines.Count -lt 3) { return $null }
+    $count = 0
+    if (-not [int]::TryParse($lines[2].Trim(), [ref]$count)) { return $null }
+    if ($lines[1].Trim() -notmatch '^[0-9a-f]{16}$') { return $null }
+    return [pscustomobject]@{
+        PackageFullName = $lines[0].Trim()
+        Hash            = $lines[1].Trim()
+        Files           = $count
+    }
+}
+
+function Write-RuntimeRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageFullName,
+        [Parameter(Mandatory = $true)][string]$Hash,
+        [Parameter(Mandatory = $true)][int]$Files
+    )
+    @(
+        $PackageFullName
+        $Hash
+        $Files
+    ) | Set-Content -LiteralPath (Get-RuntimeRecordPath) -Encoding ASCII
+}
+
+function Test-CachedRuntime {
+    param(
+        [Parameter(Mandatory = $true)]$Application,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot
+    )
+
+    $record = Read-RuntimeRecord
+    if ($null -eq $record -or $record.PackageFullName -ne $Application.PackageFullName) { return $false }
+    $destination = Join-Path $RuntimeRoot $record.Hash
+    foreach ($relative in @('manifest.json', 'bin\node.exe', 'bin\node_repl.exe')) {
+        $sourceFile = Join-Path $Application.RuntimeSource $relative
+        $destinationFile = Join-Path $destination $relative
+        if (-not (Test-Path -LiteralPath $destinationFile -PathType Leaf)) { return $false }
+        if ((Get-Item -LiteralPath $sourceFile).Length -ne (Get-Item -LiteralPath $destinationFile).Length) { return $false }
+    }
+    $destinationCount = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+    return ($destinationCount -eq $record.Files)
+}
+
+function Install-PackagedRuntime {
     param(
         [Parameter(Mandatory = $true)]$Application,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)]$Staging
+        [Parameter(Mandatory = $true)][string]$Hash
     )
 
     $source = $Application.RuntimeSource
     if (-not (Test-Path -LiteralPath $source -PathType Container)) {
         throw "This app version does not include a packaged runtime at $source"
     }
-
-    New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
-    $destination = Join-Path $RuntimeRoot $Staging.Hash
-    if (Test-RuntimeTree -Source $source -Destination $destination) {
-        Write-Log "Runtime $($Staging.Hash) is already complete."
-        return $false
+    if (@(Get-ChatGptProcesses -Application $Application).Count -gt 0) {
+        throw 'ChatGPT is running. Refusing to copy the runtime over an active startup.'
     }
 
-    $temporary = Join-Path $RuntimeRoot ('.launcher-install-{0}-{1}' -f $Staging.Hash, $PID)
-    $backup = $null
+    New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+    $destination = Join-Path $RuntimeRoot $Hash
+    $temporary = Join-Path $RuntimeRoot ('.launcher-install-{0}-{1}' -f $Hash, $PID)
     Assert-ChildPath -Parent $RuntimeRoot -Child $temporary
     Assert-ChildPath -Parent $RuntimeRoot -Child $destination
     if (Test-Path -LiteralPath $temporary) {
-        throw "Temporary runtime directory already exists: $temporary"
+        Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    $sourceSummary = Get-TreeSummary -Path $source
-    Write-Log ('Preparing runtime {0} from the signed Store package ({1} files, {2:N1} MB).' -f
-        $Staging.Hash, $sourceSummary.Files, ($sourceSummary.Bytes / 1MB))
-
+    Write-Log "Preparing runtime $Hash before launch. ChatGPT is not running."
     New-Item -ItemType Directory -Path $temporary -ErrorAction Stop | Out-Null
     $promoted = $false
+    $backup = $null
     try {
         $robocopy = Join-Path $env:WINDIR 'System32\robocopy.exe'
         if (-not (Test-Path -LiteralPath $robocopy -PathType Leaf)) { throw 'robocopy.exe was not found.' }
 
-        # Direct native invocation preserves paths containing spaces.
-        & $robocopy $source $temporary '/E' '/MT:8' '/NFL' '/NDL' '/NJH' '/NJS' '/NC' '/NS' '/NP' '/R:1' '/W:1' | Out-Null
+        # /COPY:DT skips the Encrypted attribute. Copying that attribute makes
+        # robocopy fail immediately on Store files. Do not pipe this command:
+        # Windows PowerShell would discard its exit code.
+        $null = & $robocopy $source $temporary '/E' '/COPY:DT' '/DCOPY:T' '/MT:8' '/XJ' '/NFL' '/NDL' '/NJH' '/NJS' '/NC' '/NS' '/NP' '/R:1' '/W:1'
         $copyExitCode = $LASTEXITCODE
         if ($copyExitCode -ge 8) { throw "robocopy failed with exit code $copyExitCode" }
 
-        Write-Log 'Validating the prepared runtime before stopping ChatGPT.'
-        if (-not (Test-RuntimeTree -Source $source -Destination $temporary -VerifyCoreHashes)) {
+        Write-Log "Copied runtime $Hash (robocopy exit $copyExitCode). Checking file lengths."
+        if (-not (Test-RuntimeTree -Source $source -Destination $temporary)) {
             throw 'The prepared runtime failed validation.'
         }
 
-        Stop-ChatGptApplication -Application $Application
+        if (@(Get-ChatGptProcesses -Application $Application).Count -gt 0) {
+            throw 'ChatGPT started during the runtime copy. Leaving its files untouched.'
+        }
 
         if (Test-Path -LiteralPath $destination -PathType Container) {
-            $backup = Join-Path $RuntimeRoot ('.launcher-backup-{0}-{1}' -f $Staging.Hash, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            $backup = Join-Path $RuntimeRoot ('.launcher-backup-{0}-{1}' -f $Hash, (Get-Date -Format 'yyyyMMdd-HHmmss'))
             Assert-ChildPath -Parent $RuntimeRoot -Child $backup
             Move-Item -LiteralPath $destination -Destination $backup -ErrorAction Stop
-            Write-Log "Preserved the previous incomplete runtime at $backup" 'WARN'
         }
 
         Move-Item -LiteralPath $temporary -Destination $destination -ErrorAction Stop
         $promoted = $true
-
         if (-not (Test-RuntimeTree -Source $source -Destination $destination)) {
             throw 'Runtime validation failed after the atomic switch.'
         }
 
-        Write-Log "Runtime $($Staging.Hash) is ready."
+        $count = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Force).Count
+        Write-RuntimeRecord -PackageFullName $Application.PackageFullName -Hash $Hash -Files $count
+        if ($backup -and (Test-Path -LiteralPath $backup)) {
+            Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log "Runtime $Hash is ready ($count files)."
         return $true
     } catch {
-        if ($backup -and (Test-Path -LiteralPath $backup)) {
-            if ($promoted -and (Test-Path -LiteralPath $destination)) {
-                $failed = Join-Path $RuntimeRoot ('.launcher-failed-{0}-{1}' -f $Staging.Hash, (Get-Date -Format 'yyyyMMdd-HHmmss'))
-                Assert-ChildPath -Parent $RuntimeRoot -Child $failed
-                Move-Item -LiteralPath $destination -Destination $failed -ErrorAction Stop
-            }
-            if (-not (Test-Path -LiteralPath $destination)) {
-                Move-Item -LiteralPath $backup -Destination $destination -ErrorAction Stop
-            }
+        if ($backup -and (Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $destination)) {
+            Move-Item -LiteralPath $backup -Destination $destination -ErrorAction SilentlyContinue
         }
         throw
     } finally {
@@ -402,6 +435,7 @@ function Acquire-LauncherMutex {
 }
 
 function Invoke-Launcher {
+    $env:CODEX_SPARKLE_ENABLED = 'false'
     $application = Get-ChatGptApplication
     if (-not $application) {
         throw 'A supported Microsoft Store ChatGPT/Codex desktop package was not found for the current user.'
@@ -420,17 +454,49 @@ function Invoke-Launcher {
     }
 
     $attempts = 0
-    $repairAttempted = $false
     $startedAt = Get-Date
     $deadline = $startedAt.AddSeconds($WaitSeconds)
     $nextStatus = $startedAt
     $runtimeRoot = Get-RuntimeRoot
 
+    $runtimeReady = $false
+    if ($RuntimeRepair -eq 'Auto' -and $runtimeRoot -and
+        (Test-Path -LiteralPath $application.RuntimeSource -PathType Container)) {
+        try {
+            $runtimeReady = Test-CachedRuntime -Application $application -RuntimeRoot $runtimeRoot
+        } catch {
+            Write-Log "Could not read the runtime cache record. $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    if ($runtimeReady) {
+        Write-Log "Runtime cache matches $($application.Version)."
+    } elseif (@(Get-ChatGptProcesses -Application $application).Count -gt 0) {
+        Write-Log 'ChatGPT is already running without a window. Waiting, without interrupting its runtime copy.'
+    } elseif ($RuntimeRepair -eq 'Auto' -and $runtimeRoot -and
+        (Test-Path -LiteralPath $application.RuntimeSource -PathType Container)) {
+        try {
+            $hash = Get-BundledRuntimeIdentity -RuntimeRoot $application.RuntimeSource
+            $destination = Join-Path $runtimeRoot $hash
+            $sourceCount = @(Get-ChildItem -LiteralPath $application.RuntimeSource -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+            $destinationCount = 0
+            if (Test-Path -LiteralPath $destination -PathType Container) {
+                $destinationCount = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+            }
+            if ($sourceCount -gt 0 -and $destinationCount -eq $sourceCount) {
+                Write-RuntimeRecord -PackageFullName $application.PackageFullName -Hash $hash -Files $sourceCount
+                Write-Log "Runtime $hash is already complete ($sourceCount files)."
+            } else {
+                Install-PackagedRuntime -Application $application -RuntimeRoot $runtimeRoot -Hash $hash | Out-Null
+            }
+        } catch {
+            Write-Log "Runtime preparation failed; the official app will copy it itself. $($_.Exception.Message)" 'WARN'
+        }
+    }
+
     if (@(Get-ChatGptProcesses -Application $application).Count -eq 0) {
         $attempts++
         Start-ChatGptApplication -Application $application
-    } else {
-        Write-Log 'ChatGPT is running in the background; waiting for its window.'
     }
 
     while ((Get-Date) -lt $deadline) {
@@ -455,52 +521,15 @@ function Invoke-Launcher {
             continue
         }
 
-        if (-not $repairAttempted -and $RuntimeRepair -eq 'Auto' -and
-            ((Get-Date) - $startedAt).TotalSeconds -ge 15 -and $runtimeRoot) {
-            $oldestProcess = $processes | Sort-Object StartTime | Select-Object -First 1
-            $staging = Get-StagingCandidate -RuntimeRoot $runtimeRoot -NotBefore $oldestProcess.StartTime.AddSeconds(-30)
-            if ($staging) {
-                $repairAttempted = $true
-                Write-Log "Detected first-start runtime staging directory $($staging.Name)."
-                if (-not (Test-Path -LiteralPath $application.RuntimeSource -PathType Container)) {
-                    Write-Log 'This app version has no packaged cua_node runtime. The official app will continue its own startup.' 'WARN'
-                    continue
-                }
-                try {
-                    $changed = Repair-PackagedRuntime -Application $application -RuntimeRoot $runtimeRoot -Staging $staging
-                } catch {
-                    Write-Log "Runtime preparation failed; waiting for the official app startup. $($_.Exception.Message)" 'WARN'
-                    if (@(Get-ChatGptProcesses -Application $application).Count -eq 0 -and $attempts -lt $MaxStartAttempts) {
-                        $attempts++
-                        Start-ChatGptApplication -Application $application
-                    }
-                    continue
-                }
-                if ($changed) {
-                    if ($attempts -ge $MaxStartAttempts) {
-                        throw "The runtime is ready, but the $MaxStartAttempts permitted start attempts have been used. Launch ChatGPT again."
-                    }
-                    $attempts++
-                    Start-ChatGptApplication -Application $application
-                    Start-Sleep -Seconds 3
-                    continue
-                }
-            }
-        }
-
         if ((Get-Date) -ge $nextStatus) {
             $elapsed = [int]((Get-Date) - $startedAt).TotalSeconds
             $message = "Waiting for the ChatGPT window ($elapsed/$WaitSeconds seconds)."
             if ($runtimeRoot) {
-                $oldestProcess = $processes | Sort-Object StartTime | Select-Object -First 1
-                $staging = Get-StagingCandidate -RuntimeRoot $runtimeRoot -NotBefore $oldestProcess.StartTime.AddSeconds(-30)
-                if ($staging) {
-                    $summary = Get-TreeSummary -Path $staging.Directory
-                    $message += (' Staging: {0} files, {1:N1} MB.' -f $summary.Files, ($summary.Bytes / 1MB))
-                }
+                $staging = Get-StagingCandidate -RuntimeRoot $runtimeRoot
+                if ($staging) { $message += ' The app is still copying its runtime.' }
             }
             Write-Log $message
-            $nextStatus = (Get-Date).AddSeconds(15)
+            $nextStatus = (Get-Date).AddSeconds(20)
         }
 
         Start-Sleep -Seconds 2
